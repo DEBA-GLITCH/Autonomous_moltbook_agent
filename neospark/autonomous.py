@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -32,9 +31,13 @@ logger = logging.getLogger(__name__)
 
 MOLTBOOK_WRITE_DELAY = 5
 
-# Only follow authors whose post scored above this threshold.
-# Keeps the following list high quality — no point following low-signal accounts.
+# Only follow authors whose post scored above this threshold
 FOLLOW_SCORE_THRESHOLD = 1000
+
+# Max times the agent will go back to comment on the same post.
+# After this many replies, it stops until there is NEW activity
+# (tracked via last_action_time_on_post).
+MAX_REPLIES_PER_POST = 3
 
 DM_ACCEPT_PROMPT = """
 You are NeoSpark, a senior AI systems engineer on MoltBook.
@@ -191,12 +194,21 @@ class AutonomousAgent:
                     )
 
                 comments = self.moltbook.get_comments(activity.post_id)
+
+                # Only reply to comments posted AFTER our last reply on this post
+                last_reply_time = self.memory.last_action_time_on_post(
+                    "reply_comment", activity.post_id
+                )
+
                 for comment in comments:
                     if sent >= self.settings.max_comment_replies_per_cycle:
                         break
                     if self._is_self_author(comment.author_name, comment.author_id):
                         continue
                     if not comment.content.strip():
+                        continue
+                    # Skip comments that existed before our last reply
+                    if last_reply_time and comment.created_at <= last_reply_time:
                         continue
                     target_id = f"comment:{comment.comment_id}"
                     if self.memory.has_action("reply_comment", target_id):
@@ -261,16 +273,12 @@ class AutonomousAgent:
                 )
 
     # ------------------------------------------------------------------
-    # Post verification challenge — solve math problem from create_post response
+    # Post verification solve
     # ------------------------------------------------------------------
 
     def _solve_post_verification(
         self, challenge: PostVerificationChallenge
     ) -> None:
-        """
-        Solve the math verification challenge MoltBook embeds in every
-        create_post response. Must be answered within ~5 minutes.
-        """
         try:
             logger.info(
                 "Solving verification challenge for post=%s code=%s",
@@ -317,13 +325,6 @@ class AutonomousAgent:
     # ------------------------------------------------------------------
 
     def _maybe_follow_author(self, author_name: str, author_id: str, score: float) -> None:
-        """
-        Follow a high-signal author after replying to their post.
-        Only follows if:
-        1. Post score is above FOLLOW_SCORE_THRESHOLD
-        2. Not already followed (tracked in memory)
-        3. Not self
-        """
         if score < FOLLOW_SCORE_THRESHOLD:
             return
         if self._is_self_author(author_name, author_id):
@@ -368,7 +369,6 @@ class AutonomousAgent:
 
                 target_id = f"post:{post.post_id}"
                 if self.memory.has_action("reply_post", target_id):
-                    # Even if already replied, still try to follow if score is high enough
                     self._maybe_follow_author(
                         post.author_name, post.author_id, candidate.score
                     )
@@ -399,7 +399,6 @@ class AutonomousAgent:
                 sent += 1
                 logger.info("Replied to top post=%s score=%.2f", post.post_id, candidate.score)
 
-                # Follow the author if their score is high enough
                 self._maybe_follow_author(
                     post.author_name, post.author_id, candidate.score
                 )
@@ -408,18 +407,66 @@ class AutonomousAgent:
                 logger.warning("Skipping candidate post due to error: %s", exc)
 
     # ------------------------------------------------------------------
-    # Replies to comments
+    # Replies to comments on other people's posts
     # ------------------------------------------------------------------
 
     def _reply_to_comments(self, ranked_candidates, all_posts: list[Post]) -> None:
-        target_posts = {candidate.post.post_id: candidate.post for candidate in ranked_candidates}
+        target_posts = {
+            candidate.post.post_id: candidate.post
+            for candidate in ranked_candidates
+        }
 
         sent = 0
         for post in target_posts.values():
             if sent >= self.settings.max_comment_replies_per_cycle:
                 break
 
+            # Hard cap — if we've already replied MAX_REPLIES_PER_POST times
+            # on this post, skip it entirely until there are new comments
+            total_replied = self.memory.count_actions_on_post(
+                "reply_comment", post.post_id
+            )
+            if total_replied >= MAX_REPLIES_PER_POST:
+                # Only come back if there are comments newer than our last reply
+                last_reply_time = self.memory.last_action_time_on_post(
+                    "reply_comment", post.post_id
+                )
+                if last_reply_time:
+                    logger.debug(
+                        "Skipping post=%s already replied %s times, "
+                        "waiting for new comments after %s",
+                        post.post_id, total_replied, last_reply_time,
+                    )
+                    # Still fetch comments to check if any are newer
+                    comments = self.moltbook.get_comments(post.post_id)
+                    new_comments = [
+                        c for c in comments
+                        if c.created_at > last_reply_time
+                        and not self._is_self_author(c.author_name, c.author_id)
+                        and c.content.strip()
+                        and not self.memory.has_action("reply_comment", f"comment:{c.comment_id}")
+                    ]
+                    if not new_comments:
+                        logger.debug(
+                            "No new comments on post=%s since last reply, skipping",
+                            post.post_id,
+                        )
+                        continue
+                    # There are new comments — reply to them
+                    for comment in new_comments:
+                        if sent >= self.settings.max_comment_replies_per_cycle:
+                            break
+                        did_reply = self._reply_single_comment(post, comment)
+                        if did_reply:
+                            sent += 1
+                    continue
+
+            # Normal path — haven't hit the cap yet
             comments = self.moltbook.get_comments(post.post_id)
+            last_reply_time = self.memory.last_action_time_on_post(
+                "reply_comment", post.post_id
+            )
+
             for comment in comments:
                 if sent >= self.settings.max_comment_replies_per_cycle:
                     break
@@ -427,7 +474,9 @@ class AutonomousAgent:
                     continue
                 if not comment.content.strip():
                     continue
-
+                # Only reply to comments newer than our last reply on this post
+                if last_reply_time and comment.created_at <= last_reply_time:
+                    continue
                 target_id = f"comment:{comment.comment_id}"
                 if self.memory.has_action("reply_comment", target_id):
                     continue
@@ -463,7 +512,10 @@ class AutonomousAgent:
                 content=final_reply,
                 metadata={"post_title": post.title},
             )
-            logger.info("Replied to comment=%s on post=%s", comment.comment_id, post.post_id)
+            logger.info(
+                "Replied to comment=%s on post=%s",
+                comment.comment_id, post.post_id,
+            )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -520,7 +572,6 @@ class AutonomousAgent:
             )
             logger.info("Created new post id=%s title=%s", created_post_id, title)
 
-            # Immediately solve the verification challenge embedded in the response
             if created_post_id and not created_post_id.startswith("unknown-"):
                 challenge = self.moltbook.extract_verification_challenge(
                     response, created_post_id
@@ -533,7 +584,7 @@ class AutonomousAgent:
                     self._solve_post_verification(challenge)
                 else:
                     logger.warning(
-                        "No verification challenge found in create_post response for post=%s",
+                        "No verification challenge in create_post response for post=%s",
                         created_post_id,
                     )
 
