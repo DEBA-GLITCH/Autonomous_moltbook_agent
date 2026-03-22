@@ -30,13 +30,7 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 
 MOLTBOOK_WRITE_DELAY = 5
-
-# Only follow authors whose post scored above this threshold
 FOLLOW_SCORE_THRESHOLD = 1000
-
-# Max times the agent will go back to comment on the same post.
-# After this many replies, it stops until there is NEW activity
-# (tracked via last_action_time_on_post).
 MAX_REPLIES_PER_POST = 3
 
 DM_ACCEPT_PROMPT = """
@@ -48,15 +42,46 @@ Keep it under 30 words. No emojis.
 
 VERIFICATION_SOLVE_PROMPT = """
 You are solving a MoltBook post verification math problem.
-The challenge text is garbled with random punctuation, spaces, and mixed case.
-Clean it up, identify the math problem, and solve it.
+The challenge text is deliberately obfuscated — random punctuation, symbols,
+brackets, and spaces are inserted between every character, and the text
+is mixed uppercase and lowercase.
+
+Your process:
+Step 1: Strip ALL punctuation, brackets, symbols (], [, ^, ~, |, <, >, \\, -, *)
+        and extra whitespace from the text.
+Step 2: Join the remaining characters and spaces together to reconstruct
+        the original readable English sentence.
+Step 3: Read the sentence and identify the math problem.
+Step 4: Solve the math precisely. Double check your arithmetic.
+Step 5: Return ONLY the final numeric answer formatted to exactly 2 decimal places.
+
+Example:
+Obfuscated: "A] L o.B sT- Er S^wImS[ aT tH iR tY T wO] cEnTiMeTeRs / sEcOnD"
+Cleaned:    "A Lobster Swims At Thirty Two Centimeters / Second"
+If asked "what is the velocity after accelerating by 8 cm/s?" → answer is 40.00
 
 Rules:
-- Return ONLY the final numeric answer.
-- Format to exactly 2 decimal places. Example: 40.00 or 525.60
-- No units, no explanation, no other text — just the number.
+- Return ONLY the number. No units. No explanation. No working shown.
+- Must be exactly 2 decimal places. Example: 40.00 or 525.60 or 8.00
+- If the problem involves division, carry the division fully before rounding.
 
-Challenge text:
+Obfuscated challenge text:
+{challenge_text}
+""".strip()
+
+VERIFICATION_SOLVE_PROMPT_RETRY = """
+A math word problem has been encoded by inserting random punctuation and
+spaces into every word. Decode it character by character and solve it.
+
+Decoding method:
+- Read each character individually, ignoring all punctuation and symbols
+- Group the characters into words based on the spaces between them
+- The result will be a normal English math word problem
+- Solve it and return ONLY the numeric answer to 2 decimal places
+
+Nothing else — just the number with 2 decimal places.
+
+Encoded text:
 {challenge_text}
 """.strip()
 
@@ -207,7 +232,6 @@ class AutonomousAgent:
                         continue
                     if not comment.content.strip():
                         continue
-                    # Skip comments that existed before our last reply
                     if last_reply_time and comment.created_at <= last_reply_time:
                         continue
                     target_id = f"comment:{comment.comment_id}"
@@ -273,58 +297,101 @@ class AutonomousAgent:
                 )
 
     # ------------------------------------------------------------------
-    # Post verification solve
+    # Post verification solve — math challenge from create_post response
     # ------------------------------------------------------------------
 
     def _solve_post_verification(
         self, challenge: PostVerificationChallenge
-    ) -> None:
+    ) -> bool:
+        """
+        Solve the math verification challenge MoltBook embeds in every
+        create_post response. Must be answered within ~5 minutes.
+        Tries twice with different prompts before giving up.
+        Returns True if verification passed, False if all attempts failed.
+        """
         try:
             logger.info(
                 "Solving verification challenge for post=%s code=%s",
                 challenge.post_id, challenge.verification_code,
             )
-            prompt = VERIFICATION_SOLVE_PROMPT.format(
-                challenge_text=challenge.challenge_text
-            )
-            answer = self.llm.chat(
-                prompt,
-                temperature=0.0,
-                max_tokens=20,
-                system_prompt="You are a precise math solver. Return only the numeric answer with 2 decimal places.",
-            )
-            answer = answer.strip()
-            answer_clean = re.sub(r"[^\d.]", "", answer)
-            if not answer_clean:
-                logger.warning(
-                    "Could not extract numeric answer from LLM response: %s", answer
+
+            prompts = [
+                VERIFICATION_SOLVE_PROMPT.format(
+                    challenge_text=challenge.challenge_text
+                ),
+                VERIFICATION_SOLVE_PROMPT_RETRY.format(
+                    challenge_text=challenge.challenge_text
+                ),
+            ]
+
+            for attempt, prompt in enumerate(prompts, 1):
+                answer = self.llm.chat(
+                    prompt,
+                    temperature=0.0,
+                    max_tokens=50,
+                    system_prompt=(
+                        "You are a precise math solver. "
+                        "Think carefully step by step, then return "
+                        "ONLY the numeric answer with exactly 2 decimal places."
+                    ),
                 )
-                return
+                answer = answer.strip()
+                answer_clean = re.sub(r"[^\d.]", "", answer)
+                if not answer_clean:
+                    logger.warning(
+                        "Attempt %s: Could not extract numeric answer from: %s",
+                        attempt, answer,
+                    )
+                    continue
 
-            try:
-                answer_formatted = f"{float(answer_clean):.2f}"
-            except ValueError:
-                logger.warning("Answer not numeric: %s", answer_clean)
-                return
+                try:
+                    answer_formatted = f"{float(answer_clean):.2f}"
+                except ValueError:
+                    logger.warning(
+                        "Attempt %s: Answer not numeric: %s", attempt, answer_clean
+                    )
+                    continue
 
-            logger.info(
-                "Submitting verification answer=%s for post=%s",
-                answer_formatted, challenge.post_id,
+                logger.info(
+                    "Attempt %s: Submitting verification answer=%s for post=%s",
+                    attempt, answer_formatted, challenge.post_id,
+                )
+                success = self.moltbook.submit_verification_answer(
+                    challenge.verification_code, answer_formatted
+                )
+                if success:
+                    logger.info(
+                        "Verification PASSED on attempt %s for post=%s",
+                        attempt, challenge.post_id,
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        "Attempt %s: Wrong answer for post=%s, trying again...",
+                        attempt, challenge.post_id,
+                    )
+                    time.sleep(2)
+
+            logger.warning(
+                "All verification attempts failed for post=%s",
+                challenge.post_id,
             )
-            self.moltbook.submit_verification_answer(
-                challenge.verification_code, answer_formatted
-            )
+            return False
+
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to solve verification for post=%s: %s",
                 challenge.post_id, exc,
             )
+            return False
 
     # ------------------------------------------------------------------
     # Follow logic
     # ------------------------------------------------------------------
 
-    def _maybe_follow_author(self, author_name: str, author_id: str, score: float) -> None:
+    def _maybe_follow_author(
+        self, author_name: str, author_id: str, score: float
+    ) -> None:
         if score < FOLLOW_SCORE_THRESHOLD:
             return
         if self._is_self_author(author_name, author_id):
@@ -377,7 +444,9 @@ class AutonomousAgent:
                 prompt = build_reply_prompt(post.title, post.content)
                 reply = self.llm.chat(prompt, temperature=0.25, max_tokens=320)
                 if not high_value_text(reply, max(35, self.settings.min_post_words // 3)):
-                    logger.debug("Skipped low-value post reply for post=%s", post.post_id)
+                    logger.debug(
+                        "Skipped low-value post reply for post=%s", post.post_id
+                    )
                     continue
                 if self.memory.is_duplicate_content(reply):
                     continue
@@ -397,8 +466,9 @@ class AutonomousAgent:
                     metadata={"score": candidate.score, "reason": candidate.reason},
                 )
                 sent += 1
-                logger.info("Replied to top post=%s score=%.2f", post.post_id, candidate.score)
-
+                logger.info(
+                    "Replied to top post=%s score=%.2f", post.post_id, candidate.score
+                )
                 self._maybe_follow_author(
                     post.author_name, post.author_id, candidate.score
                 )
@@ -421,52 +491,41 @@ class AutonomousAgent:
             if sent >= self.settings.max_comment_replies_per_cycle:
                 break
 
-            # Hard cap — if we've already replied MAX_REPLIES_PER_POST times
-            # on this post, skip it entirely until there are new comments
             total_replied = self.memory.count_actions_on_post(
                 "reply_comment", post.post_id
             )
-            if total_replied >= MAX_REPLIES_PER_POST:
-                # Only come back if there are comments newer than our last reply
-                last_reply_time = self.memory.last_action_time_on_post(
-                    "reply_comment", post.post_id
-                )
-                if last_reply_time:
-                    logger.debug(
-                        "Skipping post=%s already replied %s times, "
-                        "waiting for new comments after %s",
-                        post.post_id, total_replied, last_reply_time,
-                    )
-                    # Still fetch comments to check if any are newer
-                    comments = self.moltbook.get_comments(post.post_id)
-                    new_comments = [
-                        c for c in comments
-                        if c.created_at > last_reply_time
-                        and not self._is_self_author(c.author_name, c.author_id)
-                        and c.content.strip()
-                        and not self.memory.has_action("reply_comment", f"comment:{c.comment_id}")
-                    ]
-                    if not new_comments:
-                        logger.debug(
-                            "No new comments on post=%s since last reply, skipping",
-                            post.post_id,
-                        )
-                        continue
-                    # There are new comments — reply to them
-                    for comment in new_comments:
-                        if sent >= self.settings.max_comment_replies_per_cycle:
-                            break
-                        did_reply = self._reply_single_comment(post, comment)
-                        if did_reply:
-                            sent += 1
-                    continue
-
-            # Normal path — haven't hit the cap yet
-            comments = self.moltbook.get_comments(post.post_id)
             last_reply_time = self.memory.last_action_time_on_post(
                 "reply_comment", post.post_id
             )
 
+            if total_replied >= MAX_REPLIES_PER_POST and last_reply_time:
+                # Already replied multiple times — only come back for NEW comments
+                comments = self.moltbook.get_comments(post.post_id)
+                new_comments = [
+                    c for c in comments
+                    if c.created_at > last_reply_time
+                    and not self._is_self_author(c.author_name, c.author_id)
+                    and c.content.strip()
+                    and not self.memory.has_action(
+                        "reply_comment", f"comment:{c.comment_id}"
+                    )
+                ]
+                if not new_comments:
+                    logger.debug(
+                        "No new comments on post=%s since last reply, skipping",
+                        post.post_id,
+                    )
+                    continue
+                for comment in new_comments:
+                    if sent >= self.settings.max_comment_replies_per_cycle:
+                        break
+                    did_reply = self._reply_single_comment(post, comment)
+                    if did_reply:
+                        sent += 1
+                continue
+
+            # Normal path — fetch and reply to new comments only
+            comments = self.moltbook.get_comments(post.post_id)
             for comment in comments:
                 if sent >= self.settings.max_comment_replies_per_cycle:
                     break
@@ -474,7 +533,6 @@ class AutonomousAgent:
                     continue
                 if not comment.content.strip():
                     continue
-                # Only reply to comments newer than our last reply on this post
                 if last_reply_time and comment.created_at <= last_reply_time:
                     continue
                 target_id = f"comment:{comment.comment_id}"
@@ -581,11 +639,25 @@ class AutonomousAgent:
                         "Got verification challenge for post=%s expires=%s",
                         created_post_id, challenge.expires_at,
                     )
-                    self._solve_post_verification(challenge)
+                    verified = self._solve_post_verification(challenge)
+                    if not verified:
+                        # All attempts failed — delete the unverified post
+                        # so it doesn't clutter the profile
+                        logger.warning(
+                            "Verification failed for post=%s — deleting unverified post",
+                            created_post_id,
+                        )
+                        deleted = self.moltbook.delete_post(created_post_id)
+                        if deleted:
+                            logger.info(
+                                "Deleted unverified post=%s", created_post_id
+                            )
+                            # Don't record in memory so it can try again next cycle
+                            return
                 else:
                     logger.warning(
-                        "No verification challenge in create_post response for post=%s",
-                        created_post_id,
+                        "No verification challenge in create_post response "
+                        "for post=%s", created_post_id,
                     )
 
         self.memory.record_action(

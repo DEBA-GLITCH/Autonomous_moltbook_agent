@@ -289,15 +289,25 @@ class MoltBookClient:
         }
         return self._request("POST", "/posts", json_payload=payload)
 
+    def delete_post(self, post_id: str) -> bool:
+        """
+        Delete a post by ID.
+        Used to clean up unverified posts when verification fails.
+        """
+        try:
+            self._request("DELETE", f"/posts/{post_id}")
+            logger.info("Deleted post=%s", post_id)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not delete post=%s: %s", post_id, exc)
+            return False
+
     def submit_verification_answer(
         self, verification_code: str, answer: str
     ) -> bool:
         """
         Submit answer to a post verification challenge.
-        MoltBook sends this challenge in the create_post response.
-        Must be solved within ~5 minutes or the post stays unverified.
-        Endpoint: POST /api/v1/verify
-        Payload:  {"verification_code": "moltbook_verify_...", "answer": "40.00"}
+        Returns True if answer was accepted, False if wrong or failed.
         """
         try:
             result = self._request(
@@ -312,11 +322,25 @@ class MoltBookClient:
                 "Verification submitted code=%s answer=%s result=%s",
                 verification_code, answer, result,
             )
+            # MoltBook returns {"success": true} on correct answer
+            if isinstance(result, dict):
+                return bool(result.get("success", False))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Verification submission failed code=%s: %s", verification_code, exc
+                "Verification submission failed code=%s: %s",
+                verification_code, exc,
             )
+            return False
+
+    def follow_agent(self, agent_name: str) -> bool:
+        """Follow an agent by their username."""
+        try:
+            self._request("POST", f"/agents/{agent_name}/follow")
+            logger.info("Followed agent=%s", agent_name)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not follow agent=%s: %s", agent_name, exc)
             return False
 
     def get_post(self, post_id: str) -> Post | None:
@@ -327,45 +351,18 @@ class MoltBookClient:
             logger.warning("Could not fetch post=%s: %s", post_id, exc)
             return None
 
-    def follow_agent(self, agent_name: str) -> bool:
-        """
-        Follow an agent by their username.
-        Endpoint: POST /api/v1/agents/{agent_name}/follow
-        """
-        try:
-            self._request("POST", f"/agents/{agent_name}/follow")
-            logger.info("Followed agent=%s", agent_name)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not follow agent=%s: %s", agent_name, exc)
-            return False
-
     @staticmethod
     def extract_created_post_id(raw_response: Any) -> str:
-        """
-        Extract post ID from create_post response.
-        Real MoltBook response shape:
-        {
-          "success": true,
-          "post": {
-            "id": "52075b1c-...",
-            ...
-          }
-        }
-        """
         if not isinstance(raw_response, dict):
             return ""
-        # Primary path: response["post"]["id"]
         post_obj = raw_response.get("post")
         if isinstance(post_obj, dict):
             post_id = _first(post_obj, ["id", "post_id"], "")
             if post_id:
                 return str(post_id)
-        # Fallback: top-level id
         direct_id = _first(raw_response, ["id", "post_id"], "")
         if direct_id:
             return str(direct_id)
-        # Fallback: data wrapper
         data = raw_response.get("data")
         if isinstance(data, dict):
             nested_id = _first(data, ["id", "post_id"], "")
@@ -382,13 +379,6 @@ class MoltBookClient:
         raw_response: Any,
         post_id: str,
     ) -> PostVerificationChallenge | None:
-        """
-        Extract the verification challenge from a create_post response.
-        MoltBook embeds it directly in the post object:
-        response["post"]["verification"]["verification_code"]
-        response["post"]["verification"]["challenge_text"]
-        response["post"]["verification"]["expires_at"]
-        """
         if not isinstance(raw_response, dict):
             return None
         post_obj = raw_response.get("post")
