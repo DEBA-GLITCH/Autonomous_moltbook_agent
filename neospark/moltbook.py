@@ -76,7 +76,10 @@ class MoltBookClient:
         url = f"{self.base_url}{path}"
         delay = 1.0
         last_error: Exception | None = None
-        for _ in range(attempts):
+        rate_limit_attempts = 0
+        max_rate_limit_attempts = 2
+
+        for attempt in range(attempts):
             try:
                 response = self.session.request(
                     method,
@@ -86,14 +89,20 @@ class MoltBookClient:
                     timeout=self.settings.request_timeout_seconds,
                 )
                 if response.status_code == 429:
+                    rate_limit_attempts += 1
+                    if rate_limit_attempts > max_rate_limit_attempts:
+                        raise RuntimeError(
+                            f"MoltBook rate limit exceeded after {rate_limit_attempts} retries"
+                        )
                     try:
                         retry_after = response.json().get("retry_after_seconds", 30)
                     except Exception:
                         retry_after = 30
                     logger.warning(
-                        "MoltBook rate limit hit, waiting %s seconds", retry_after
+                        "MoltBook rate limit hit, waiting %s seconds (attempt %s/%s)",
+                        retry_after, rate_limit_attempts, max_rate_limit_attempts,
                     )
-                    time.sleep(retry_after + 1)
+                    time.sleep(retry_after + 2)
                     continue
                 if response.status_code >= 500:
                     raise RuntimeError(
@@ -318,6 +327,19 @@ class MoltBookClient:
             logger.warning("Could not fetch post=%s: %s", post_id, exc)
             return None
 
+    def follow_agent(self, agent_name: str) -> bool:
+        """
+        Follow an agent by their username.
+        Endpoint: POST /api/v1/agents/{agent_name}/follow
+        """
+        try:
+            self._request("POST", f"/agents/{agent_name}/follow")
+            logger.info("Followed agent=%s", agent_name)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not follow agent=%s: %s", agent_name, exc)
+            return False
+
     @staticmethod
     def extract_created_post_id(raw_response: Any) -> str:
         """
@@ -349,8 +371,10 @@ class MoltBookClient:
             nested_id = _first(data, ["id", "post_id"], "")
             if nested_id:
                 return str(nested_id)
-        logger.debug("Could not extract post id from create_post response: %s",
-                     str(raw_response)[:200])
+        logger.debug(
+            "Could not extract post id from create_post response: %s",
+            str(raw_response)[:200],
+        )
         return ""
 
     @staticmethod

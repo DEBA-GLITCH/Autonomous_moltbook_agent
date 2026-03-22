@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -30,6 +31,10 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 
 MOLTBOOK_WRITE_DELAY = 5
+
+# Only follow authors whose post scored above this threshold.
+# Keeps the following list high quality — no point following low-signal accounts.
+FOLLOW_SCORE_THRESHOLD = 1000
 
 DM_ACCEPT_PROMPT = """
 You are NeoSpark, a senior AI systems engineer on MoltBook.
@@ -102,7 +107,7 @@ class AutonomousAgent:
         # Step 4: Reply to comments on own posts
         self._handle_own_post_activity()
 
-        # Step 5: Reply to top-author posts
+        # Step 5: Reply to top-author posts + follow high-signal authors
         if posts:
             top_authors = pick_top_authors(posts, self.settings.top_agent_percent)
             ranked_candidates = rank_posts(posts, top_authors)
@@ -265,7 +270,6 @@ class AutonomousAgent:
         """
         Solve the math verification challenge MoltBook embeds in every
         create_post response. Must be answered within ~5 minutes.
-        The challenge text is garbled with random punctuation and mixed case.
         """
         try:
             logger.info(
@@ -281,7 +285,6 @@ class AutonomousAgent:
                 max_tokens=20,
                 system_prompt="You are a precise math solver. Return only the numeric answer with 2 decimal places.",
             )
-            # Strip everything except digits and decimal point
             answer = answer.strip()
             answer_clean = re.sub(r"[^\d.]", "", answer)
             if not answer_clean:
@@ -290,7 +293,6 @@ class AutonomousAgent:
                 )
                 return
 
-            # Ensure 2 decimal places
             try:
                 answer_formatted = f"{float(answer_clean):.2f}"
             except ValueError:
@@ -311,6 +313,46 @@ class AutonomousAgent:
             )
 
     # ------------------------------------------------------------------
+    # Follow logic
+    # ------------------------------------------------------------------
+
+    def _maybe_follow_author(self, author_name: str, author_id: str, score: float) -> None:
+        """
+        Follow a high-signal author after replying to their post.
+        Only follows if:
+        1. Post score is above FOLLOW_SCORE_THRESHOLD
+        2. Not already followed (tracked in memory)
+        3. Not self
+        """
+        if score < FOLLOW_SCORE_THRESHOLD:
+            return
+        if self._is_self_author(author_name, author_id):
+            return
+        if not author_name or author_name == "unknown":
+            return
+
+        target_id = f"follow:{author_name.lower()}"
+        if self.memory.has_action("follow", target_id):
+            return
+
+        if self.settings.dry_run:
+            logger.info("[DRY_RUN] follow agent=%s score=%.2f", author_name, score)
+        else:
+            success = self.moltbook.follow_agent(author_name)
+            if not success:
+                return
+            time.sleep(MOLTBOOK_WRITE_DELAY)
+
+        self.memory.record_action(
+            "follow",
+            target_id,
+            author_id=author_id,
+            content=f"Followed {author_name}",
+            metadata={"score": score},
+        )
+        logger.info("Followed agent=%s score=%.2f", author_name, score)
+
+    # ------------------------------------------------------------------
     # Replies to top-author posts
     # ------------------------------------------------------------------
 
@@ -326,6 +368,10 @@ class AutonomousAgent:
 
                 target_id = f"post:{post.post_id}"
                 if self.memory.has_action("reply_post", target_id):
+                    # Even if already replied, still try to follow if score is high enough
+                    self._maybe_follow_author(
+                        post.author_name, post.author_id, candidate.score
+                    )
                     continue
 
                 prompt = build_reply_prompt(post.title, post.content)
@@ -341,6 +387,7 @@ class AutonomousAgent:
                 else:
                     self.moltbook.reply_to_post(post.post_id, reply)
                     time.sleep(MOLTBOOK_WRITE_DELAY)
+
                 self.memory.record_action(
                     "reply_post",
                     target_id,
@@ -351,6 +398,12 @@ class AutonomousAgent:
                 )
                 sent += 1
                 logger.info("Replied to top post=%s score=%.2f", post.post_id, candidate.score)
+
+                # Follow the author if their score is high enough
+                self._maybe_follow_author(
+                    post.author_name, post.author_id, candidate.score
+                )
+
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Skipping candidate post due to error: %s", exc)
 
@@ -467,8 +520,7 @@ class AutonomousAgent:
             )
             logger.info("Created new post id=%s title=%s", created_post_id, title)
 
-            # Immediately solve the verification challenge embedded in the response.
-            # MoltBook gives a ~5 minute window — solve it now while we have the data.
+            # Immediately solve the verification challenge embedded in the response
             if created_post_id and not created_post_id.startswith("unknown-"):
                 challenge = self.moltbook.extract_verification_challenge(
                     response, created_post_id
