@@ -17,7 +17,7 @@ from .decision import (
 from .llm import LLMClient
 from .memory import MemoryStore
 from .models import Comment, Post
-from .moltbook import MoltBookClient
+from .moltbook import MoltBookClient, PostVerificationChallenge
 from .prompts import (
     SYSTEM_PERSONA_PROMPT,
     SYSTEM_STRUCTURED_OUTPUT_PROMPT,
@@ -29,7 +29,6 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 
-# Seconds to wait between write requests to respect MoltBook rate limits
 MOLTBOOK_WRITE_DELAY = 5
 
 DM_ACCEPT_PROMPT = """
@@ -37,6 +36,20 @@ You are NeoSpark, a senior AI systems engineer on MoltBook.
 An agent has sent you a DM request. Write a short, direct 1-2 sentence
 acceptance message. Mention you're open to technical discussion.
 Keep it under 30 words. No emojis.
+""".strip()
+
+VERIFICATION_SOLVE_PROMPT = """
+You are solving a MoltBook post verification math problem.
+The challenge text is garbled with random punctuation, spaces, and mixed case.
+Clean it up, identify the math problem, and solve it.
+
+Rules:
+- Return ONLY the final numeric answer.
+- Format to exactly 2 decimal places. Example: 40.00 or 525.60
+- No units, no explanation, no other text — just the number.
+
+Challenge text:
+{challenge_text}
 """.strip()
 
 
@@ -75,18 +88,18 @@ class AutonomousAgent:
         # Step 1: Handle DM requests
         self._handle_dm_requests()
 
-        # Step 2: Fetch posts from home + explore feed
+        # Step 2: Fetch posts
         posts = self.moltbook.get_home_posts()
         if not posts:
             logger.info("No posts found in feed.")
         else:
             logger.info("Fetched %s posts from feed", len(posts))
 
-        # Step 3: Verification challenges
+        # Step 3: Verification challenges from feed
         if posts:
             self._handle_verification_challenges(posts)
 
-        # Step 4: Reply to comments on our own posts
+        # Step 4: Reply to comments on own posts
         self._handle_own_post_activity()
 
         # Step 5: Reply to top-author posts
@@ -99,11 +112,9 @@ class AutonomousAgent:
                 len(top_authors),
             )
             self._reply_to_ranked_posts(ranked_candidates)
-
-            # Step 6: Reply to comments on ranked posts
             self._reply_to_comments(ranked_candidates, posts)
 
-        # Step 7: Maybe create a new original post
+        # Step 6: Maybe create a new post
         self._maybe_create_post(posts)
 
     # ------------------------------------------------------------------
@@ -201,7 +212,7 @@ class AutonomousAgent:
             logger.info("Replied to %s comment(s) on own posts", sent)
 
     # ------------------------------------------------------------------
-    # Verification challenges
+    # Verification challenges from feed posts
     # ------------------------------------------------------------------
 
     def _handle_verification_challenges(self, posts: list[Post]) -> None:
@@ -241,10 +252,63 @@ class AutonomousAgent:
                 logger.info("Replied to verification challenge post=%s", post.post_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Skipping verification challenge post=%s due to error: %s",
-                    post.post_id,
-                    exc,
+                    "Skipping verification challenge post=%s: %s", post.post_id, exc
                 )
+
+    # ------------------------------------------------------------------
+    # Post verification challenge — solve math problem from create_post response
+    # ------------------------------------------------------------------
+
+    def _solve_post_verification(
+        self, challenge: PostVerificationChallenge
+    ) -> None:
+        """
+        Solve the math verification challenge MoltBook embeds in every
+        create_post response. Must be answered within ~5 minutes.
+        The challenge text is garbled with random punctuation and mixed case.
+        """
+        try:
+            logger.info(
+                "Solving verification challenge for post=%s code=%s",
+                challenge.post_id, challenge.verification_code,
+            )
+            prompt = VERIFICATION_SOLVE_PROMPT.format(
+                challenge_text=challenge.challenge_text
+            )
+            answer = self.llm.chat(
+                prompt,
+                temperature=0.0,
+                max_tokens=20,
+                system_prompt="You are a precise math solver. Return only the numeric answer with 2 decimal places.",
+            )
+            # Strip everything except digits and decimal point
+            answer = answer.strip()
+            answer_clean = re.sub(r"[^\d.]", "", answer)
+            if not answer_clean:
+                logger.warning(
+                    "Could not extract numeric answer from LLM response: %s", answer
+                )
+                return
+
+            # Ensure 2 decimal places
+            try:
+                answer_formatted = f"{float(answer_clean):.2f}"
+            except ValueError:
+                logger.warning("Answer not numeric: %s", answer_clean)
+                return
+
+            logger.info(
+                "Submitting verification answer=%s for post=%s",
+                answer_formatted, challenge.post_id,
+            )
+            self.moltbook.submit_verification_answer(
+                challenge.verification_code, answer_formatted
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to solve verification for post=%s: %s",
+                challenge.post_id, exc,
+            )
 
     # ------------------------------------------------------------------
     # Replies to top-author posts
@@ -291,7 +355,7 @@ class AutonomousAgent:
                 logger.warning("Skipping candidate post due to error: %s", exc)
 
     # ------------------------------------------------------------------
-    # Replies to comments on other people's posts
+    # Replies to comments
     # ------------------------------------------------------------------
 
     def _reply_to_comments(self, ranked_candidates, all_posts: list[Post]) -> None:
@@ -335,8 +399,6 @@ class AutonomousAgent:
                     comment.comment_id, post.post_id,
                 )
             else:
-                # parent_comment_id intentionally not passed —
-                # MoltBook API rejects it with 400
                 self.moltbook.reply_to_post(post.post_id, final_reply)
                 time.sleep(MOLTBOOK_WRITE_DELAY)
 
@@ -353,14 +415,12 @@ class AutonomousAgent:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed replying to comment=%s on post=%s: %s",
-                comment.comment_id,
-                post.post_id,
-                exc,
+                comment.comment_id, post.post_id, exc,
             )
             return False
 
     # ------------------------------------------------------------------
-    # Original post creation
+    # Original post creation + immediate verification solve
     # ------------------------------------------------------------------
 
     def _maybe_create_post(self, posts: list[Post]) -> None:
@@ -401,9 +461,29 @@ class AutonomousAgent:
         else:
             response = self.moltbook.create_post(title, content)
             time.sleep(MOLTBOOK_WRITE_DELAY)
+
             created_post_id = self.moltbook.extract_created_post_id(response) or (
                 f"unknown-{self.memory.content_hash(title)[:10]}"
             )
+            logger.info("Created new post id=%s title=%s", created_post_id, title)
+
+            # Immediately solve the verification challenge embedded in the response.
+            # MoltBook gives a ~5 minute window — solve it now while we have the data.
+            if created_post_id and not created_post_id.startswith("unknown-"):
+                challenge = self.moltbook.extract_verification_challenge(
+                    response, created_post_id
+                )
+                if challenge:
+                    logger.info(
+                        "Got verification challenge for post=%s expires=%s",
+                        created_post_id, challenge.expires_at,
+                    )
+                    self._solve_post_verification(challenge)
+                else:
+                    logger.warning(
+                        "No verification challenge found in create_post response for post=%s",
+                        created_post_id,
+                    )
 
         self.memory.record_action(
             "create_post",
@@ -414,7 +494,6 @@ class AutonomousAgent:
             metadata={"title": title},
         )
         self.memory.remember_post_topic(created_post_id, title)
-        logger.info("Created new post id=%s title=%s", created_post_id, title)
 
     # ------------------------------------------------------------------
     # Helpers

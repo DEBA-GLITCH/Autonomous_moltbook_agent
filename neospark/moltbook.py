@@ -43,6 +43,14 @@ class DmRequest:
     preview: str = ""
 
 
+@dataclass
+class PostVerificationChallenge:
+    post_id: str
+    verification_code: str
+    challenge_text: str
+    expires_at: str
+
+
 class MoltBookClient:
 
     def __init__(self, settings: Settings):
@@ -78,7 +86,6 @@ class MoltBookClient:
                     timeout=self.settings.request_timeout_seconds,
                 )
                 if response.status_code == 429:
-                    # MoltBook rate limit — parse retry_after and wait
                     try:
                         retry_after = response.json().get("retry_after_seconds", 30)
                     except Exception:
@@ -260,8 +267,8 @@ class MoltBookClient:
     def reply_to_post(
         self, post_id: str, content: str, *, parent_comment_id: str | None = None
     ) -> Any:
-        # parent_comment_id is intentionally ignored —
-        # MoltBook API rejects it with 400 "property parent_comment_id should not exist"
+        # parent_comment_id intentionally ignored —
+        # MoltBook API rejects it with 400
         payload: dict[str, Any] = {"content": content}
         return self._request("POST", f"/posts/{post_id}/comments", json_payload=payload)
 
@@ -273,6 +280,36 @@ class MoltBookClient:
         }
         return self._request("POST", "/posts", json_payload=payload)
 
+    def submit_verification_answer(
+        self, verification_code: str, answer: str
+    ) -> bool:
+        """
+        Submit answer to a post verification challenge.
+        MoltBook sends this challenge in the create_post response.
+        Must be solved within ~5 minutes or the post stays unverified.
+        Endpoint: POST /api/v1/verify
+        Payload:  {"verification_code": "moltbook_verify_...", "answer": "40.00"}
+        """
+        try:
+            result = self._request(
+                "POST",
+                "/verify",
+                json_payload={
+                    "verification_code": verification_code,
+                    "answer": answer,
+                },
+            )
+            logger.info(
+                "Verification submitted code=%s answer=%s result=%s",
+                verification_code, answer, result,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Verification submission failed code=%s: %s", verification_code, exc
+            )
+            return False
+
     def get_post(self, post_id: str) -> Post | None:
         try:
             raw = self._request("GET", f"/posts/{post_id}")
@@ -280,6 +317,73 @@ class MoltBookClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch post=%s: %s", post_id, exc)
             return None
+
+    @staticmethod
+    def extract_created_post_id(raw_response: Any) -> str:
+        """
+        Extract post ID from create_post response.
+        Real MoltBook response shape:
+        {
+          "success": true,
+          "post": {
+            "id": "52075b1c-...",
+            ...
+          }
+        }
+        """
+        if not isinstance(raw_response, dict):
+            return ""
+        # Primary path: response["post"]["id"]
+        post_obj = raw_response.get("post")
+        if isinstance(post_obj, dict):
+            post_id = _first(post_obj, ["id", "post_id"], "")
+            if post_id:
+                return str(post_id)
+        # Fallback: top-level id
+        direct_id = _first(raw_response, ["id", "post_id"], "")
+        if direct_id:
+            return str(direct_id)
+        # Fallback: data wrapper
+        data = raw_response.get("data")
+        if isinstance(data, dict):
+            nested_id = _first(data, ["id", "post_id"], "")
+            if nested_id:
+                return str(nested_id)
+        logger.debug("Could not extract post id from create_post response: %s",
+                     str(raw_response)[:200])
+        return ""
+
+    @staticmethod
+    def extract_verification_challenge(
+        raw_response: Any,
+        post_id: str,
+    ) -> PostVerificationChallenge | None:
+        """
+        Extract the verification challenge from a create_post response.
+        MoltBook embeds it directly in the post object:
+        response["post"]["verification"]["verification_code"]
+        response["post"]["verification"]["challenge_text"]
+        response["post"]["verification"]["expires_at"]
+        """
+        if not isinstance(raw_response, dict):
+            return None
+        post_obj = raw_response.get("post")
+        if not isinstance(post_obj, dict):
+            return None
+        verification = post_obj.get("verification")
+        if not isinstance(verification, dict):
+            return None
+        code = str(verification.get("verification_code", "")).strip()
+        challenge = str(verification.get("challenge_text", "")).strip()
+        expires = str(verification.get("expires_at", "")).strip()
+        if not code or not challenge:
+            return None
+        return PostVerificationChallenge(
+            post_id=post_id,
+            verification_code=code,
+            challenge_text=challenge,
+            expires_at=expires,
+        )
 
     @staticmethod
     def _normalize_feed_post(item: dict[str, Any]) -> Post | None:
@@ -446,17 +550,3 @@ class MoltBookClient:
             created_at=str(_first(source, ["created_at", "timestamp", "created"], "")),
             raw=item,
         )
-
-    @staticmethod
-    def extract_created_post_id(raw_response: Any) -> str:
-        if isinstance(raw_response, dict):
-            direct_id = _first(raw_response, ["id", "post_id"], "")
-            if direct_id:
-                return str(direct_id)
-            data = raw_response.get("data")
-            if isinstance(data, dict):
-                nested_id = _first(data, ["id", "post_id"], "")
-                if nested_id:
-                    return str(nested_id)
-        logger.debug("Could not extract post id from create_post response")
-        return ""
