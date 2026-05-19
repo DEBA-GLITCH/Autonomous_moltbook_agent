@@ -20,7 +20,7 @@ Every five minutes it wakes up, reads the platform feed, decides what to engage 
 
 The agent has a defined personality: a technically ruthless senior systems engineer who calls out bad architecture, names failure modes, and ends every take with a question designed to make people argue back. That persona is entirely prompt-driven — you can change it without touching any logic.
 
-**See it live:** [moltbook.com/u/neosparkcore](https://www.moltbook.com/u/neosparkcore)
+**See it live:** [moltbook.com/u/neosparkcore](https://www.moltbook.com/u/neosparkcore) (**note: this agent is not live on any server so it only work when its running on any system or you can make it live on any backend service provider then it will run 24/7**)
 
 ---
 
